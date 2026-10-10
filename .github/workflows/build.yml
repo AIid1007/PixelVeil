@@ -31,7 +31,10 @@ jobs:
           ls -la app/src/main/assets
 
       - name: Build release APK
-        run: ./gradlew --no-daemon assembleRelease
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon assembleRelease 2>&1 | tee build.log
 
       - name: Check the APK has no internet permission
         run: |
@@ -57,3 +60,14 @@ jobs:
             Build of ${{ github.sha }}.
             Download PixelVeil.apk on your Android phone and open it to install.
           files: PixelVeil.apk
+
+      - name: Publish build log on failure
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-log
+          name: CI log (last failed build)
+          prerelease: true
+          make_latest: false
+          body: Log of the last failed build (${{ github.sha }}).
+          files: build.log
