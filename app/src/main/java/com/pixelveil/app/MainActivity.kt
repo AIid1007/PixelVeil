@@ -44,7 +44,7 @@ class MainActivity : ComponentActivity() {
     private var screen by mutableStateOf<Screen>(Screen.Home)
     private var homeMessage by mutableStateOf<String?>(null)
     private var refreshKey by mutableIntStateOf(0)
-    private var progress by mutableIntStateOf(-1)
+    private var exportProgress by mutableIntStateOf(-1)
     private var lastSettings = PixelSettings()
     private var exporter: Exporter? = null
     private var progressJob: Job? = null
@@ -86,7 +86,7 @@ class MainActivity : ComponentActivity() {
 
                     is Screen.Exporting -> {
                         BackHandler { cancelExport() }
-                        ExportingScreen(progress = progress, onCancel = { cancelExport() })
+                        ExportingScreen(progress = exportProgress, onCancel = { cancelExport() })
                     }
 
                     is Screen.Done -> {
@@ -129,7 +129,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startExport(source: Uri, info: VideoInfo, deletable: Boolean, settings: PixelSettings) {
-        progress = -1
+        exportProgress = -1
         screen = Screen.Exporting(source, deletable)
         val ex = Exporter(
             context = applicationContext,
@@ -161,7 +161,7 @@ class MainActivity : ComponentActivity() {
         ex.start()
         progressJob = lifecycleScope.launch {
             while (true) {
-                progress = ex.progress()
+                exportProgress = ex.progress()
                 delay(250)
             }
         }
