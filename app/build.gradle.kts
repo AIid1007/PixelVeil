@@ -14,10 +14,6 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
-        ndk {
-            // Real phones only; drops emulator libraries to keep the APK small.
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
-        }
     }
 
     buildTypes {
@@ -25,6 +21,10 @@ android {
             isMinifyEnabled = false
             // Personal tool: release build signed with the debug key so it installs directly.
             signingConfig = signingConfigs.getByName("debug")
+            ndk {
+                // Release = real phones only (smaller APK). Debug keeps x86 so the PC emulator works.
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            }
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -74,3 +74,27 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 }
+
+// Downloads the on-device models into src/main/assets on the first build (they are not in git).
+val modelFiles = mapOf(
+    "selfie_multiclass_256x256.tflite" to
+        "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+    "blaze_face_short_range.tflite" to
+        "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite",
+)
+val downloadModels by tasks.registering {
+    val assetsDir = file("src/main/assets")
+    doLast {
+        assetsDir.mkdirs()
+        modelFiles.forEach { (name, url) ->
+            val target = File(assetsDir, name)
+            if (!target.exists() || target.length() == 0L) {
+                logger.lifecycle("Downloading model $name")
+                java.net.URI(url).toURL().openStream().use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                }
+            }
+        }
+    }
+}
+tasks.named("preBuild") { dependsOn(downloadModels) }

@@ -29,4 +29,4 @@ Key files:
 
 ## Build it yourself
 
-Models are not committed. Download them into `app/src/main/assets/` (URLs are in `.github/workflows/build.yml`), then open the project in Android Studio and run, or `./gradlew assembleRelease`.
+Open the project in Android Studio and press Run. The first build downloads the two models into `app/src/main/assets/` automatically (they are not committed).
