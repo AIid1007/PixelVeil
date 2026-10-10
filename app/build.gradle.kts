@@ -56,6 +56,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:$media3")
     implementation("androidx.media3:media3-ui:$media3")
     implementation("androidx.media3:media3-container:$media3")
+    implementation("androidx.media3:media3-muxer:$media3")
 
     implementation("com.google.mediapipe:tasks-vision:0.10.20")
 
