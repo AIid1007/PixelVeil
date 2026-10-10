@@ -87,7 +87,7 @@ fun HomeScreen(
     onOpen: (ExportItem) -> Unit,
     onDeleted: () -> Unit,
 ) {
-    val items by produceState(initialValue = emptyList<ExportItem>(), refreshKey) {
+    val exports by produceState(initialValue = emptyList<ExportItem>(), refreshKey) {
         value = withContext(Dispatchers.IO) { repo.list() }
     }
     var confirmDelete by remember { mutableStateOf<ExportItem?>(null) }
@@ -117,11 +117,11 @@ fun HomeScreen(
         Spacer(Modifier.height(28.dp))
         Text("My exports", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
         Spacer(Modifier.height(8.dp))
-        if (items.isEmpty()) {
+        if (exports.isEmpty()) {
             Text("Your pixelated videos will appear here.", color = Muted, fontSize = 14.sp)
         }
         LazyColumn(Modifier.weight(1f)) {
-            items(items, key = { it.uri.toString() }) { item ->
+            items(exports, key = { it.uri.toString() }) { item ->
                 ExportRow(repo, item, onClick = { onOpen(item) }, onDelete = { confirmDelete = item })
             }
         }
