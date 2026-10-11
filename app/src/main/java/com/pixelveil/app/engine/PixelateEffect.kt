@@ -16,6 +16,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -53,7 +54,16 @@ internal class PixelateShaderProgram(
 
     private val appContext = context.applicationContext
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
-    private val engine: MaskEngine = executor.submit<MaskEngine> { MaskEngine(appContext) }.get()
+    /**
+     * Models load on the worker thread so the video pipeline never waits for them.
+     * The executor is single-threaded, so analysis jobs queued later always run after this.
+     */
+    private val engineFuture: Future<MaskEngine> = executor.submit<MaskEngine> {
+        MaskEngine(appContext).also { settings.usingFallbackDetector = it.usingFallback }
+    }
+
+    /** Preview only: the analysis currently running in the background, if any. */
+    private var pending: Future<Analysis?>? = null
 
     private val pixelProgram = GlProgram(VERTEX_SHADER, PIXEL_FRAGMENT_SHADER)
     private val copyProgram = GlProgram(VERTEX_SHADER, COPY_FRAGMENT_SHADER)
@@ -80,7 +90,6 @@ internal class PixelateShaderProgram(
     private val tracker = MaskTracker()
 
     init {
-        settings.usingFallbackDetector = engine.usingFallback
         val bounds = GlUtil.getNormalizedCoordinateBounds()
         pixelProgram.setBufferAttribute("aFramePosition", bounds, GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE)
         copyProgram.setBufferAttribute("aFramePosition", bounds, GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE)
@@ -121,8 +130,23 @@ internal class PixelateShaderProgram(
         }
 
         if (!fullFrame) {
-            if (shouldAnalyze(presentationTimeUs, s)) {
-                analyze(inputTexId, s)
+            if (preview) {
+                // Never block playback: collect a finished result, start a new one when idle.
+                pending?.let { job ->
+                    if (job.isDone) {
+                        accept(runCatching { job.get() }.getOrNull())
+                        pending = null
+                    }
+                }
+                if (pending == null && shouldAnalyze(presentationTimeUs, s)) {
+                    pending = startAnalysis(inputTexId, s)
+                    lastAnalysisUs = presentationTimeUs
+                    lastAnalysisWallMs = SystemClock.elapsedRealtime()
+                }
+            } else if (shouldAnalyze(presentationTimeUs, s)) {
+                // Export: wait for every analysis so each frame's mask matches that frame.
+                val job = startAnalysis(inputTexId, s)
+                accept(job?.let { runCatching { it.get() }.getOrNull() })
                 lastAnalysisUs = presentationTimeUs
                 lastAnalysisWallMs = SystemClock.elapsedRealtime()
             }
@@ -144,7 +168,7 @@ internal class PixelateShaderProgram(
     }
 
     private fun shouldAnalyze(timeUs: Long, s: PixelSettings): Boolean {
-        if (lastAnalysis == null || lastAnalysisUs == Long.MIN_VALUE || timeUs < lastAnalysisUs) return true
+        if (lastAnalysisUs == Long.MIN_VALUE || timeUs < lastAnalysisUs) return true
         return if (preview) {
             SystemClock.elapsedRealtime() - lastAnalysisWallMs >= PREVIEW_ANALYSIS_INTERVAL_MS
         } else if (s.mode == Mode.PRIVACY) {
@@ -154,7 +178,8 @@ internal class PixelateShaderProgram(
         }
     }
 
-    private fun analyze(inputTexId: Int, s: PixelSettings) {
+    /** Reads back a small copy of the frame and queues the models on it. Returns null if not possible. */
+    private fun startAnalysis(inputTexId: Int, s: PixelSettings): Future<Analysis?>? {
         // 1. Draw the frame into a small FBO and read it back.
         val prevFbo = IntArray(1)
         val viewport = IntArray(4)
@@ -175,7 +200,7 @@ internal class PixelateShaderProgram(
         GLES20.glViewport(viewport[0], viewport[1], viewport[2], viewport[3])
 
         // 2. Make an upright bitmap: GL rows start at the bottom, then apply rotation.
-        val bmp = rbBitmap ?: return
+        val bmp = rbBitmap ?: return null
         rbBuffer.rewind()
         bmp.copyPixelsFromBuffer(rbBuffer)
         val m = Matrix().apply {
@@ -186,15 +211,23 @@ internal class PixelateShaderProgram(
 
         // 3. Run the models off the GL thread (MediaPipe must not disturb this EGL context).
         val wantFaces = s.mode == Mode.PRIVACY && (s.target == Target.HEAD || s.target == Target.PERSON)
-        val result = try {
-            executor.submit<Analysis> { engine.analyze(upright, wantFaces) }.get()
+        return try {
+            executor.submit<Analysis?> {
+                try {
+                    engineFuture.get().analyze(upright, wantFaces)
+                } catch (t: Throwable) {
+                    null
+                } finally {
+                    upright.recycle()
+                }
+            }
         } catch (t: Throwable) {
+            upright.recycle()
             null
-        } finally {
-            // upright is used only inside analyze().
         }
-        upright.recycle()
+    }
 
+    private fun accept(result: Analysis?) {
         val now = SystemClock.elapsedRealtime()
         settings.lastAnalysisMs = now
         if (result != null) {
@@ -270,14 +303,16 @@ internal class PixelateShaderProgram(
         deleteReadback()
         if (gridTex != 0) GLES20.glDeleteTextures(1, intArrayOf(gridTex), 0)
         gridTex = 0
-        executor.execute { engine.close() }
+        pending?.cancel(false)
+        pending = null
+        executor.execute { runCatching { engineFuture.get().close() } }
         executor.shutdown()
     }
 
     companion object {
         /** Long side of the copy sent to the models. The segmenter works at 256x256 internally. */
         private const val ANALYSIS_LONG_SIDE = 256
-        private const val PREVIEW_ANALYSIS_INTERVAL_MS = 80L
+        private const val PREVIEW_ANALYSIS_INTERVAL_MS = 120L
         private const val STYLE_EXPORT_ANALYSIS_INTERVAL_US = 33_000L
 
         private const val VERTEX_SHADER = """
