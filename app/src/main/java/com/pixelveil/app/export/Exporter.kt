@@ -44,8 +44,11 @@ class Exporter(
     private val progressHolder = ProgressHolder()
     val outputFile: File = File(context.cacheDir, "export_${System.currentTimeMillis()}.mp4")
     private var transformer: Transformer? = null
+    private var attempt = 0
+    private var cancelled = false
 
     fun start() {
+        attempt++
         val s = holder.value
         val audioProcessors = mutableListOf<AudioProcessor>()
         if (s.voice.pitch != 1f) {
@@ -85,7 +88,12 @@ class Exporter(
                     exportException: ExportException,
                 ) {
                     outputFile.delete()
-                    onError(exportException.message ?: "Export failed (code ${exportException.errorCode})")
+                    if (!cancelled && attempt < MAX_ATTEMPTS) {
+                        // Hardware codecs occasionally fail to start; one fresh try usually works.
+                        start()
+                    } else {
+                        onError(exportException.message ?: "Export failed (code ${exportException.errorCode})")
+                    }
                 }
             })
             .build()
@@ -105,7 +113,12 @@ class Exporter(
     }
 
     fun cancel() {
+        cancelled = true
         transformer?.cancel()
         outputFile.delete()
+    }
+
+    private companion object {
+        const val MAX_ATTEMPTS = 2
     }
 }
