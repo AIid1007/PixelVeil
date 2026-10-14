@@ -30,6 +30,18 @@ jobs:
             https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite
           ls -la app/src/main/assets
 
+      - name: Publish the model files (Apache 2.0, from Google MediaPipe)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: models
+          name: On-device models used by PixelVeil
+          prerelease: true
+          make_latest: false
+          body: MediaPipe models (Apache License 2.0) bundled into the app at build time.
+          files: |
+            app/src/main/assets/selfie_multiclass_256x256.tflite
+            app/src/main/assets/blaze_face_short_range.tflite
+
       - name: Build release APK
         shell: bash
         run: |
