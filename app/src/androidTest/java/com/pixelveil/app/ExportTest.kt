@@ -1,8 +1,16 @@
 package com.pixelveil.app
 
+import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.util.Log
+import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import com.pixelveil.app.engine.MaskTrack
+import com.pixelveil.app.engine.PixelateEffect
+import com.pixelveil.app.engine.SettingsHolder
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.pixelveil.app.engine.MaskEngine
@@ -46,8 +54,12 @@ class ExportTest {
         val track = MaskEngine(ctx).use { engine ->
             VideoAnalyzer(ctx, uri, info.rotation, info.durationMs).run(engine, {}, { false })
         }
-        Log.i(TAG, "$asset: analysed ${track.size} frames")
+        Log.i(TAG, "$asset: analysed ${track.size} frames, person found: ${track.hasPerson()}")
         assertTrue("analysed frames for $asset: ${track.size}", track.size >= 10)
+        assertTrue("a person should be detected in $asset", track.hasPerson())
+
+        // Mimic the app: preview with the effect, release the player, then export straight away.
+        previewThenRelease(uri, info, track)
 
         val cases = listOf(
             PixelSettings(target = Target.PERSON, mode = Mode.PRIVACY, voice = Voice.DEEP),
@@ -75,15 +87,83 @@ class ExportTest {
             val outInfo = VideoInfo.read(ctx, Uri.fromFile(out))
             Log.i(TAG, "$asset $settings -> ${out!!.length()} bytes, $outInfo")
             assertNotNull("output readable", outInfo)
+            if (settings.target == Target.PERSON) checkPixelsLandOnPerson(asset, uri, Uri.fromFile(out))
             out.delete()
         }
     }
 
-    @Test
-    fun portraitVideo() = analyzeAndExport("sample.mp4")
+    private fun previewThenRelease(uri: Uri, info: VideoInfo, track: MaskTrack) {
+        var player: ExoPlayer? = null
+        instrumentation.runOnMainSync {
+            player = ExoPlayer.Builder(ctx).build().apply {
+                setVideoEffects(listOf(PixelateEffect(SettingsHolder(PixelSettings()), track, info.width, info.height, info.rotation)))
+                setMediaItem(MediaItem.fromUri(uri))
+                prepare()
+                playWhenReady = true
+            }
+        }
+        Thread.sleep(2000)
+        instrumentation.runOnMainSync { player?.release() }
+    }
+
+    /** Upright luminance image of the frame at [timeUs], whatever way the file stores it. */
+    private fun uprightFrame(uri: Uri, timeUs: Long): Bitmap {
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(ctx, uri)
+            val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            val frame = r.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)!!
+            // Display is portrait (720x1280). If the retriever gave the stored (unrotated) frame, rotate it.
+            return if (frame.width > frame.height && rot % 180 == 90) {
+                Bitmap.createBitmap(frame, 0, 0, frame.width, frame.height, Matrix().apply { postRotate(rot.toFloat()) }, true)
+            } else frame
+        } finally {
+            r.release()
+        }
+    }
+
+    /** Mean absolute neighbour difference (texture) of a region given in 720x1280 display coordinates. */
+    private fun texture(b: Bitmap, x0: Int, y0: Int, x1: Int, y1: Int): Double {
+        val sx = b.width / 720.0
+        val sy = b.height / 1280.0
+        val l = (x0 * sx).toInt(); val t = (y0 * sy).toInt()
+        val w = ((x1 - x0) * sx).toInt(); val h = ((y1 - y0) * sy).toInt()
+        val px = IntArray(w * h)
+        b.getPixels(px, 0, w, l, t, w, h)
+        fun lum(c: Int) = ((c shr 16 and 0xFF) * 3 + (c shr 8 and 0xFF) * 6 + (c and 0xFF)) / 10
+        var sum = 0.0
+        var n = 0
+        for (y in 0 until h - 1) for (x in 0 until w - 1) {
+            val c = lum(px[y * w + x])
+            sum += Math.abs(c - lum(px[y * w + x + 1])) + Math.abs(c - lum(px[(y + 1) * w + x]))
+            n++
+        }
+        return sum / n
+    }
+
+    /**
+     * The person sits in the centre of the frame over a noisy background. After a Person export
+     * the person's area must lose most of its detail, and the empty top of the frame must keep it.
+     * A mask that is rotated or shifted would fail one of the two.
+     */
+    private fun checkPixelsLandOnPerson(asset: String, src: Uri, out: Uri) {
+        val t = 1_000_000L
+        val a = uprightFrame(src, t)
+        val b = uprightFrame(out, t)
+        val faceSrc = texture(a, 300, 600, 440, 760)
+        val faceOut = texture(b, 300, 600, 440, 760)
+        val bgSrc = texture(a, 40, 60, 680, 380)
+        val bgOut = texture(b, 40, 60, 680, 380)
+        Log.i(TAG, "$asset alignment: face $faceSrc -> $faceOut, background $bgSrc -> $bgOut")
+        assertTrue("person area should be pixelated in $asset ($faceSrc -> $faceOut)", faceOut < faceSrc * 0.6)
+        assertTrue("background should stay sharp in $asset ($bgSrc -> $bgOut)", bgOut > bgSrc * 0.6)
+    }
 
     @Test
-    fun rotatedPhoneVideo() = analyzeAndExport("sample_rotated.mp4")
+    fun portraitVideo() = analyzeAndExport("person.mp4")
+
+    @Test
+    fun rotatedPhoneVideo() = analyzeAndExport("person_rotated.mp4")
 
     companion object {
         private const val TAG = "PixelVeilTest"
