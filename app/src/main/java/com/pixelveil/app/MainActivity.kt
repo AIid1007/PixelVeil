@@ -1,5 +1,7 @@
 package com.pixelveil.app
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -9,6 +11,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -16,7 +19,11 @@ import androidx.core.content.IntentCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.util.UnstableApi
 import com.pixelveil.app.data.ExportsRepository
+import com.pixelveil.app.engine.MaskEngine
+import com.pixelveil.app.engine.MaskTrack
 import com.pixelveil.app.engine.PixelSettings
+import com.pixelveil.app.engine.VideoAnalyzer
+import com.pixelveil.app.ui.AnalyzingScreen
 import com.pixelveil.app.export.Exporter
 import com.pixelveil.app.export.VideoInfo
 import com.pixelveil.app.ui.DoneScreen
@@ -32,7 +39,8 @@ import kotlinx.coroutines.withContext
 
 private sealed interface Screen {
     data object Home : Screen
-    data class Editor(val uri: Uri, val info: VideoInfo, val deletable: Boolean) : Screen
+    data class Analyzing(val uri: Uri, val info: VideoInfo, val deletable: Boolean) : Screen
+    data class Editor(val uri: Uri, val info: VideoInfo, val track: MaskTrack, val deletable: Boolean) : Screen
     data class Exporting(val source: Uri, val deletable: Boolean) : Screen
     data class Done(val output: Uri, val original: Uri?) : Screen
 }
@@ -45,6 +53,9 @@ class MainActivity : ComponentActivity() {
     private var homeMessage by mutableStateOf<String?>(null)
     private var refreshKey by mutableIntStateOf(0)
     private var exportProgress by mutableIntStateOf(-1)
+    private var analysisProgress by mutableFloatStateOf(0f)
+    private var analysisJob: Job? = null
+    private var crashReport by mutableStateOf<String?>(null)
     private var lastSettings = PixelSettings()
     private var exporter: Exporter? = null
     private var progressJob: Job? = null
@@ -56,6 +67,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         repo = ExportsRepository(applicationContext)
+        crashReport = CrashLog.readReport(applicationContext)
         handleShareIntent(intent)
 
         setContent {
@@ -68,18 +80,33 @@ class MainActivity : ComponentActivity() {
                         onPick = { homeMessage = null; pickVideo.launch(arrayOf("video/*")) },
                         onOpen = { screen = Screen.Done(it.uri, null) },
                         onDeleted = { refreshKey++ },
+                        crashReport = crashReport,
+                        onCopyCrashReport = { report ->
+                            val cm = getSystemService(ClipboardManager::class.java)
+                            cm?.setPrimaryClip(ClipData.newPlainText("PixelVeil crash report", report))
+                        },
+                        onDismissCrashReport = {
+                            CrashLog.acknowledge(applicationContext)
+                            crashReport = null
+                        },
                     )
+
+                    is Screen.Analyzing -> {
+                        BackHandler { cancelAnalysis() }
+                        AnalyzingScreen(progress = analysisProgress, onCancel = { cancelAnalysis() })
+                    }
 
                     is Screen.Editor -> {
                         BackHandler { screen = Screen.Home }
                         EditorScreen(
                             uri = s.uri,
                             info = s.info,
+                            track = s.track,
                             initial = lastSettings,
                             onBack = { screen = Screen.Home },
                             onExport = { settings ->
                                 lastSettings = settings
-                                startExport(s.uri, s.info, s.deletable, settings)
+                                startExport(s.uri, s.info, s.track, s.deletable, settings)
                             },
                         )
                     }
@@ -123,18 +150,54 @@ class MainActivity : ComponentActivity() {
                 homeMessage = "That file couldn't be opened as a video."
                 screen = Screen.Home
             } else {
-                screen = Screen.Editor(uri, info, deletable)
+                startAnalysis(uri, info, deletable)
             }
         }
     }
 
-    private fun startExport(source: Uri, info: VideoInfo, deletable: Boolean, settings: PixelSettings) {
+    /** One pass over the whole video to find people in every frame ("Optimising media"). */
+    private fun startAnalysis(uri: Uri, info: VideoInfo, deletable: Boolean) {
+        analysisJob?.cancel()
+        analysisProgress = 0f
+        screen = Screen.Analyzing(uri, info, deletable)
+        analysisJob = lifecycleScope.launch {
+            val job = coroutineContext[Job]
+            val result = withContext(Dispatchers.Default) {
+                runCatching {
+                    MaskEngine(applicationContext).use { engine ->
+                        VideoAnalyzer(applicationContext, uri, info.rotation, info.durationMs).run(
+                            engine,
+                            onProgress = { p -> lifecycleScope.launch { analysisProgress = p } },
+                            isCancelled = { job?.isActive == false },
+                        )
+                    }
+                }
+            }
+            if (job?.isActive == false) return@launch
+            result.fold(
+                onSuccess = { track -> screen = Screen.Editor(uri, info, track, deletable) },
+                onFailure = { e ->
+                    homeMessage = e.message ?: "This video couldn't be analysed."
+                    screen = Screen.Home
+                },
+            )
+        }
+    }
+
+    private fun cancelAnalysis() {
+        analysisJob?.cancel()
+        analysisJob = null
+        screen = Screen.Home
+    }
+
+    private fun startExport(source: Uri, info: VideoInfo, track: MaskTrack, deletable: Boolean, settings: PixelSettings) {
         exportProgress = -1
         screen = Screen.Exporting(source, deletable)
         val ex = Exporter(
             context = applicationContext,
             source = source,
             info = info,
+            track = track,
             settings = settings,
             onDone = { file ->
                 progressJob?.cancel()

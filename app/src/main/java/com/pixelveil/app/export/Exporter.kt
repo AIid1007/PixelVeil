@@ -19,6 +19,7 @@ import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.InAppMuxer
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import com.pixelveil.app.engine.MaskTrack
 import com.pixelveil.app.engine.PixelSettings
 import com.pixelveil.app.engine.PixelateEffect
 import com.pixelveil.app.engine.SettingsHolder
@@ -34,6 +35,7 @@ class Exporter(
     private val context: Context,
     private val source: Uri,
     private val info: VideoInfo,
+    private val track: MaskTrack,
     settings: PixelSettings,
     private val onDone: (File) -> Unit,
     private val onError: (String) -> Unit,
@@ -49,7 +51,7 @@ class Exporter(
         if (s.voice.pitch != 1f) {
             audioProcessors += SonicAudioProcessor().apply { setPitch(s.voice.pitch) }
         }
-        val effect = PixelateEffect(holder, info.width, info.height, info.rotation, preview = false)
+        val effect = PixelateEffect(holder, track, info.width, info.height, info.rotation)
         val edited = EditedMediaItem.Builder(MediaItem.fromUri(source))
             .setEffects(Effects(audioProcessors, listOf(effect)))
             .build()
@@ -60,7 +62,11 @@ class Exporter(
         // Drop GPS location, XMP and Android mdta tags (device make/model) from the output.
         val muxerFactory = InAppMuxer.Factory.Builder()
             .setMetadataProvider { entries ->
-                entries.removeAll { it is Mp4LocationData || it is XmpData || it is MdtaMetadataEntry }
+                try {
+                    entries.removeAll { it is Mp4LocationData || it is XmpData || it is MdtaMetadataEntry }
+                } catch (_: UnsupportedOperationException) {
+                    // Read-only set: nothing to strip from this source.
+                }
             }
             .build()
 
@@ -84,7 +90,12 @@ class Exporter(
             })
             .build()
         transformer = t
-        t.start(composition, outputFile.absolutePath)
+        try {
+            t.start(composition, outputFile.absolutePath)
+        } catch (e: Throwable) {
+            outputFile.delete()
+            onError(e.message ?: e.javaClass.simpleName)
+        }
     }
 
     /** 0..100, or -1 when not known yet. */

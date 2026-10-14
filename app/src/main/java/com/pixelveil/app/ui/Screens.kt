@@ -64,6 +64,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.pixelveil.app.data.ExportItem
 import com.pixelveil.app.data.ExportsRepository
+import com.pixelveil.app.engine.MaskTrack
 import com.pixelveil.app.engine.Mode
 import com.pixelveil.app.engine.PixelSettings
 import com.pixelveil.app.engine.PixelateEffect
@@ -86,6 +87,9 @@ fun HomeScreen(
     onPick: () -> Unit,
     onOpen: (ExportItem) -> Unit,
     onDeleted: () -> Unit,
+    crashReport: String? = null,
+    onCopyCrashReport: (String) -> Unit = {},
+    onDismissCrashReport: () -> Unit = {},
 ) {
     val exports by produceState(initialValue = emptyList<ExportItem>(), refreshKey) {
         value = withContext(Dispatchers.IO) { repo.list() }
@@ -112,6 +116,28 @@ fun HomeScreen(
         if (message != null) {
             Spacer(Modifier.height(12.dp))
             Text(message, color = MaterialThemeError, fontSize = 13.sp)
+        }
+
+        if (crashReport != null) {
+            var copied by remember { mutableStateOf(false) }
+            Spacer(Modifier.height(16.dp))
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Surface).padding(14.dp),
+            ) {
+                Text("PixelVeil closed unexpectedly last time.", color = Color.White, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Copy the report and paste it to whoever is fixing the app. It stays on your phone until you share it.",
+                    color = Muted,
+                    fontSize = 12.sp,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+                    Button(
+                        onClick = { onCopyCrashReport(crashReport); copied = true },
+                        shape = RoundedCornerShape(10.dp),
+                    ) { Text(if (copied) "Copied" else "Copy report") }
+                    TextButton(onClick = onDismissCrashReport) { Text("Dismiss", color = Muted) }
+                }
+            }
         }
 
         Spacer(Modifier.height(28.dp))
@@ -193,6 +219,7 @@ private fun ExportRow(repo: ExportsRepository, item: ExportItem, onClick: () -> 
 fun EditorScreen(
     uri: Uri,
     info: VideoInfo,
+    track: MaskTrack,
     initial: PixelSettings,
     onBack: () -> Unit,
     onExport: (PixelSettings) -> Unit,
@@ -205,7 +232,7 @@ fun EditorScreen(
 
     val player = remember(uri) {
         ExoPlayer.Builder(context).build().apply {
-            setVideoEffects(listOf(PixelateEffect(holder, info.width, info.height, info.rotation, preview = true)))
+            setVideoEffects(listOf(PixelateEffect(holder, track, info.width, info.height, info.rotation)))
             setMediaItem(MediaItem.fromUri(uri))
             repeatMode = Player.REPEAT_MODE_ALL
             prepare()
@@ -218,15 +245,11 @@ fun EditorScreen(
         holder.value = settings
         player.playbackParameters = PlaybackParameters(1f, settings.voice.pitch)
     }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(500)
-            val s = holder.value
-            val needsPerson = s.target == Target.HEAD || s.target == Target.PERSON || s.target == Target.CLOTHING
-            val analysed = holder.lastAnalysisMs
-            showNoPersonHint = needsPerson && analysed > 0 && analysed - holder.lastPersonSeenMs > 3000
-            usingFallback = holder.usingFallbackDetector
-        }
+    val trackHasPerson = remember(track) { track.hasPerson() }
+    LaunchedEffect(settings) {
+        val needsPerson = settings.target == Target.HEAD || settings.target == Target.PERSON || settings.target == Target.CLOTHING
+        showNoPersonHint = needsPerson && !trackHasPerson
+        usingFallback = holder.usingFallbackDetector
     }
 
     Column(Modifier.fillMaxSize().background(Background).systemBarsPadding()) {
@@ -254,7 +277,7 @@ fun EditorScreen(
             )
             if (showNoPersonHint) {
                 Text(
-                    "No person found yet. Try Full frame.",
+                    "No person found in this video. Try Full frame.",
                     color = Color.Black,
                     fontSize = 13.sp,
                     modifier = Modifier
@@ -499,4 +522,38 @@ private fun ShareButton(label: String, modifier: Modifier, onClick: () -> Unit) 
         shape = RoundedCornerShape(10.dp),
         colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color.Black),
     ) { Text(label, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+}
+
+// ---------------------------------------------------------------- Analyzing
+
+@Composable
+fun AnalyzingScreen(progress: Float, onCancel: () -> Unit) {
+    val view = LocalView.current
+    DisposableEffect(Unit) {
+        view.keepScreenOn = true
+        onDispose { view.keepScreenOn = false }
+    }
+    Column(
+        Modifier.fillMaxSize().background(Background).systemBarsPadding().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Optimising media…", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(20.dp))
+        LinearProgressIndicator(
+            progress = { progress.coerceIn(0f, 1f) },
+            modifier = Modifier.fillMaxWidth().height(6.dp),
+            color = Accent,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text("${(progress * 100).roundToInt()}%", color = Muted)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Finding people in every frame, on your phone. This runs once per video.",
+            color = Muted,
+            fontSize = 13.sp,
+        )
+        Spacer(Modifier.height(28.dp))
+        OutlinedButton(onClick = onCancel, shape = RoundedCornerShape(10.dp)) { Text("Cancel", color = Color.White) }
+    }
 }

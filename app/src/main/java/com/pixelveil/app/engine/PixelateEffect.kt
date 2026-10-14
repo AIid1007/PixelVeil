@@ -1,10 +1,7 @@
 package com.pixelveil.app.engine
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.opengl.GLES20
-import android.os.SystemClock
 import androidx.media3.common.util.GlProgram
 import androidx.media3.common.util.GlUtil
 import androidx.media3.common.util.Size
@@ -14,106 +11,73 @@ import androidx.media3.effect.GlEffect
 import androidx.media3.effect.GlShaderProgram
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import java.util.concurrent.Future
-import kotlin.math.max
-import kotlin.math.roundToInt
 
 /**
- * Media3 video effect that pixelates the chosen target. Used both by ExoPlayer (live preview)
- * and by Transformer (export), so what you preview is what you get.
+ * Media3 video effect that pixelates the chosen target, using masks computed beforehand by
+ * [VideoAnalyzer]. Used by ExoPlayer (preview) and Transformer (export), so what you preview is
+ * what you get. No models run here, so it never slows playback or export down.
  *
  * @param rawWidth width reported by the file (before rotation metadata is applied)
  * @param rawHeight height reported by the file
  * @param rotationDegrees the file's rotation metadata (clockwise)
- * @param preview true for the player: analyse at a lower rate to keep playback smooth
  */
 @UnstableApi
 class PixelateEffect(
     private val settings: SettingsHolder,
+    private val track: MaskTrack,
     private val rawWidth: Int,
     private val rawHeight: Int,
     private val rotationDegrees: Int,
-    private val preview: Boolean,
 ) : GlEffect {
     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
-        PixelateShaderProgram(context, useHdr, settings, rawWidth, rawHeight, rotationDegrees, preview)
+        PixelateShaderProgram(useHdr, settings, track, rawWidth, rawHeight, rotationDegrees)
 }
 
 @UnstableApi
 internal class PixelateShaderProgram(
-    context: Context,
     useHdr: Boolean,
     private val settings: SettingsHolder,
+    private val track: MaskTrack,
     private val rawWidth: Int,
     private val rawHeight: Int,
     private val rotationDegrees: Int,
-    private val preview: Boolean,
 ) : BaseGlShaderProgram(/* useHighPrecisionColorComponents= */ useHdr, /* texturePoolCapacity= */ 1) {
 
-    private val appContext = context.applicationContext
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
-    /**
-     * Models load on the worker thread so the video pipeline never waits for them.
-     * The executor is single-threaded, so analysis jobs queued later always run after this.
-     */
-    private val engineFuture: Future<MaskEngine> = executor.submit<MaskEngine> {
-        MaskEngine(appContext).also { settings.usingFallbackDetector = it.usingFallback }
-    }
-
-    /** Preview only: the analysis currently running in the background, if any. */
-    private var pending: Future<Analysis?>? = null
-
     private val pixelProgram = GlProgram(VERTEX_SHADER, PIXEL_FRAGMENT_SHADER)
-    private val copyProgram = GlProgram(VERTEX_SHADER, COPY_FRAGMENT_SHADER)
 
     private var texW = 0
     private var texH = 0
-    /** Clockwise rotation needed to make the texture image upright for analysis. */
+    /** Clockwise rotation that turns the texture image upright (the space masks are stored in). */
     private var analysisRotation = 0
-
-    private var rbW = 0
-    private var rbH = 0
-    private var rbTex = 0
-    private var rbFbo = 0
-    private var rbBuffer: ByteBuffer = ByteBuffer.allocateDirect(4)
-    private var rbBitmap: Bitmap? = null
 
     private var gridTex = 0
     private var grid = ByteArray(1)
+    private var neighbourGrid = ByteArray(1)
     private var gridBuffer: ByteBuffer = ByteBuffer.allocateDirect(1)
-
-    private var lastAnalysis: Analysis? = null
-    private var lastAnalysisUs = Long.MIN_VALUE
-    private var lastAnalysisWallMs = 0L
     private val tracker = MaskTracker()
 
     init {
-        val bounds = GlUtil.getNormalizedCoordinateBounds()
-        pixelProgram.setBufferAttribute("aFramePosition", bounds, GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE)
-        copyProgram.setBufferAttribute("aFramePosition", bounds, GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE)
+        pixelProgram.setBufferAttribute(
+            "aFramePosition",
+            GlUtil.getNormalizedCoordinateBounds(),
+            GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE,
+        )
     }
 
     override fun configure(inputWidth: Int, inputHeight: Int): Size {
         texW = inputWidth
         texH = inputHeight
-
-        // If the frames reach us unrotated (same orientation as the raw file) and the file
-        // carries a 90/270 rotation, rotate the analysis copy so the model sees people upright.
+        // If frames reach us unrotated (same orientation as the raw file) and the file carries a
+        // 90/270 rotation, masks (stored upright) must be rotated back into texture space.
         val texLandscape = texW >= texH
         val rawLandscape = rawWidth >= rawHeight
-        analysisRotation = if ((rotationDegrees == 90 || rotationDegrees == 270) && texLandscape == rawLandscape && rawWidth != rawHeight) {
-            rotationDegrees
-        } else {
-            0
-        }
-
-        val scale = ANALYSIS_LONG_SIDE.toFloat() / max(texW, texH)
-        rbW = max(16, (texW * scale).roundToInt())
-        rbH = max(16, (texH * scale).roundToInt())
-        allocateReadback()
-        if (gridTex == 0) gridTex = createTexture(GLES20.GL_NEAREST)
+        analysisRotation =
+            if ((rotationDegrees == 90 || rotationDegrees == 270) && texLandscape == rawLandscape && rawWidth != rawHeight) {
+                rotationDegrees
+            } else {
+                0
+            }
+        if (gridTex == 0) gridTex = createTexture()
         tracker.reset()
         return Size(inputWidth, inputHeight)
     }
@@ -122,38 +86,26 @@ internal class PixelateShaderProgram(
         val s = settings.value
         val displayW = if (analysisRotation % 180 == 90) texH else texW
         val spec = GridSpec.create(texW, texH, displayW, PixelSettings.blocksAcross(s.amount, s.mode))
-        val fullFrame = s.target == Target.FULL_FRAME
 
         if (grid.size < spec.size) {
             grid = ByteArray(spec.size)
+            neighbourGrid = ByteArray(spec.size)
             gridBuffer = ByteBuffer.allocateDirect(spec.size).order(ByteOrder.nativeOrder())
         }
 
-        if (!fullFrame) {
-            if (preview) {
-                // Never block playback: collect a finished result, start a new one when idle.
-                pending?.let { job ->
-                    if (job.isDone) {
-                        accept(runCatching { job.get() }.getOrNull())
-                        pending = null
-                    }
-                }
-                if (pending == null && shouldAnalyze(presentationTimeUs, s)) {
-                    pending = startAnalysis(inputTexId, s)
-                    lastAnalysisUs = presentationTimeUs
-                    lastAnalysisWallMs = SystemClock.elapsedRealtime()
-                }
-            } else if (shouldAnalyze(presentationTimeUs, s)) {
-                // Export: wait for every analysis so each frame's mask matches that frame.
-                val job = startAnalysis(inputTexId, s)
-                accept(job?.let { runCatching { it.get() }.getOrNull() })
-                lastAnalysisUs = presentationTimeUs
-                lastAnalysisWallMs = SystemClock.elapsedRealtime()
-            }
-            GridBuilder.build(lastAnalysis, s, analysisRotation, spec, grid)
-            tracker.apply(grid, spec, lastAnalysis?.personPresent ?: false, presentationTimeUs, s)
-        } else {
+        if (s.target == Target.FULL_FRAME) {
             java.util.Arrays.fill(grid, 0, spec.size, 0xFF.toByte())
+        } else {
+            val (current, next) = track.around(presentationTimeUs)
+            GridBuilder.build(current, s, analysisRotation, spec, grid)
+            var present = current?.personPresent == true
+            // Privacy: also cover where the person is about to be, so fast movement never leaks.
+            if (s.mode == Mode.PRIVACY && next != null && next !== current && s.target != Target.BACKGROUND) {
+                GridBuilder.build(next, s, analysisRotation, spec, neighbourGrid)
+                for (i in 0 until spec.size) if (neighbourGrid[i].toInt() != 0) grid[i] = 0xFF.toByte()
+                present = present || next.personPresent
+            }
+            tracker.apply(grid, spec, present, track.normalize(presentationTimeUs), s)
         }
         uploadGrid(spec)
 
@@ -165,75 +117,6 @@ internal class PixelateShaderProgram(
         pixelProgram.bindAttributesAndUniforms()
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GlUtil.checkGlError()
-    }
-
-    private fun shouldAnalyze(timeUs: Long, s: PixelSettings): Boolean {
-        if (lastAnalysisUs == Long.MIN_VALUE || timeUs < lastAnalysisUs) return true
-        return if (preview) {
-            SystemClock.elapsedRealtime() - lastAnalysisWallMs >= PREVIEW_ANALYSIS_INTERVAL_MS
-        } else if (s.mode == Mode.PRIVACY) {
-            true
-        } else {
-            timeUs - lastAnalysisUs >= STYLE_EXPORT_ANALYSIS_INTERVAL_US
-        }
-    }
-
-    /** Reads back a small copy of the frame and queues the models on it. Returns null if not possible. */
-    private fun startAnalysis(inputTexId: Int, s: PixelSettings): Future<Analysis?>? {
-        // 1. Draw the frame into a small FBO and read it back.
-        val prevFbo = IntArray(1)
-        val viewport = IntArray(4)
-        GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, prevFbo, 0)
-        GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, viewport, 0)
-
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, rbFbo)
-        GLES20.glViewport(0, 0, rbW, rbH)
-        copyProgram.use()
-        copyProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
-        copyProgram.bindAttributesAndUniforms()
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-        rbBuffer.rewind()
-        GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 1)
-        GLES20.glReadPixels(0, 0, rbW, rbH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, rbBuffer)
-
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, prevFbo[0])
-        GLES20.glViewport(viewport[0], viewport[1], viewport[2], viewport[3])
-
-        // 2. Make an upright bitmap: GL rows start at the bottom, then apply rotation.
-        val bmp = rbBitmap ?: return null
-        rbBuffer.rewind()
-        bmp.copyPixelsFromBuffer(rbBuffer)
-        val m = Matrix().apply {
-            postScale(1f, -1f)
-            if (analysisRotation != 0) postRotate(analysisRotation.toFloat())
-        }
-        val upright = Bitmap.createBitmap(bmp, 0, 0, rbW, rbH, m, false)
-
-        // 3. Run the models off the GL thread (MediaPipe must not disturb this EGL context).
-        val wantFaces = s.mode == Mode.PRIVACY && (s.target == Target.HEAD || s.target == Target.PERSON)
-        return try {
-            executor.submit<Analysis?> {
-                try {
-                    engineFuture.get().analyze(upright, wantFaces)
-                } catch (t: Throwable) {
-                    null
-                } finally {
-                    upright.recycle()
-                }
-            }
-        } catch (t: Throwable) {
-            upright.recycle()
-            null
-        }
-    }
-
-    private fun accept(result: Analysis?) {
-        val now = SystemClock.elapsedRealtime()
-        settings.lastAnalysisMs = now
-        if (result != null) {
-            lastAnalysis = result
-            if (result.personPresent) settings.lastPersonSeenMs = now
-        }
     }
 
     private fun uploadGrid(spec: GridSpec) {
@@ -250,45 +133,12 @@ internal class PixelateShaderProgram(
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
     }
 
-    private fun allocateReadback() {
-        deleteReadback()
-        val prevFbo = IntArray(1)
-        GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, prevFbo, 0)
-
-        rbTex = createTexture(GLES20.GL_LINEAR)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, rbTex)
-        GLES20.glTexImage2D(
-            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, rbW, rbH, 0,
-            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null,
-        )
-        val fbo = IntArray(1)
-        GLES20.glGenFramebuffers(1, fbo, 0)
-        rbFbo = fbo[0]
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, rbFbo)
-        GLES20.glFramebufferTexture2D(
-            GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, rbTex, 0,
-        )
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, prevFbo[0])
-
-        rbBuffer = ByteBuffer.allocateDirect(rbW * rbH * 4).order(ByteOrder.nativeOrder())
-        rbBitmap = Bitmap.createBitmap(rbW, rbH, Bitmap.Config.ARGB_8888)
-    }
-
-    private fun deleteReadback() {
-        if (rbFbo != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(rbFbo), 0)
-        if (rbTex != 0) GLES20.glDeleteTextures(1, intArrayOf(rbTex), 0)
-        rbFbo = 0
-        rbTex = 0
-        rbBitmap?.recycle()
-        rbBitmap = null
-    }
-
-    private fun createTexture(filter: Int): Int {
+    private fun createTexture(): Int {
         val t = IntArray(1)
         GLES20.glGenTextures(1, t, 0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, t[0])
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, filter)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, filter)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         return t[0]
@@ -296,25 +146,12 @@ internal class PixelateShaderProgram(
 
     override fun release() {
         super.release()
-        try {
-            pixelProgram.delete()
-            copyProgram.delete()
-        } catch (_: Throwable) {}
-        deleteReadback()
+        try { pixelProgram.delete() } catch (_: Throwable) {}
         if (gridTex != 0) GLES20.glDeleteTextures(1, intArrayOf(gridTex), 0)
         gridTex = 0
-        pending?.cancel(false)
-        pending = null
-        executor.execute { runCatching { engineFuture.get().close() } }
-        executor.shutdown()
     }
 
     companion object {
-        /** Long side of the copy sent to the models. The segmenter works at 256x256 internally. */
-        private const val ANALYSIS_LONG_SIDE = 256
-        private const val PREVIEW_ANALYSIS_INTERVAL_MS = 120L
-        private const val STYLE_EXPORT_ANALYSIS_INTERVAL_US = 33_000L
-
         private const val VERTEX_SHADER = """
 attribute vec4 aFramePosition;
 varying vec2 vTexSamplingCoord;
@@ -324,19 +161,7 @@ void main() {
 }
 """
 
-        private const val COPY_FRAGMENT_SHADER = """
-precision mediump float;
-uniform sampler2D uTexSampler;
-varying vec2 vTexSamplingCoord;
-void main() {
-  gl_FragColor = texture2D(uTexSampler, vTexSamplingCoord);
-}
-"""
-
-        /**
-         * For cells marked in the grid: flat average of 16 samples spread over the cell.
-         * Other pixels pass through untouched.
-         */
+        /** Marked cells: flat average of 16 samples over the cell. Other pixels pass through. */
         private const val PIXEL_FRAGMENT_SHADER = """
 precision highp float;
 uniform sampler2D uTexSampler;
