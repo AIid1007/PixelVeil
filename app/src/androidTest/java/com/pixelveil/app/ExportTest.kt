@@ -57,6 +57,8 @@ class ExportTest {
         Log.i(TAG, "$asset: analysed ${track.size} frames, person found: ${track.hasPerson()}")
         assertTrue("analysed frames for $asset: ${track.size}", track.size >= 10)
         assertTrue("a person should be detected in $asset", track.hasPerson())
+        Log.i(TAG, "$asset: face width fraction ${track.faceWidthFraction}")
+        assertNotNull("a face size should be measured in $asset", track.faceWidthFraction)
 
         // Mimic the app: preview with the effect, release the player, then export straight away.
         previewThenRelease(uri, info, track)

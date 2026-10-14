@@ -43,9 +43,38 @@ data class PixelSettings(
         /** Privacy mode never allows more than this many blocks across (i.e. blocks never finer). */
         const val PRIVACY_MAX_BLOCKS = 24.0
 
-        /** Lowest slider value allowed in Privacy mode (~0.64). */
+        /** Coarsest: a face is this many blocks wide at 100%. */
+        private const val MIN_FACE_BLOCKS = 3.0
+
+        /** Finest: a face is this many blocks wide at 0% (Style only). */
+        private const val MAX_FACE_BLOCKS = 30.0
+
+        /** Privacy mode never lets a face be more than this many blocks wide. */
+        const val PRIVACY_MAX_FACE_BLOCKS = 6.0
+
+        /** Lowest slider value allowed in Privacy mode (= face 6 blocks wide, ~0.70). */
         val PRIVACY_MIN_AMOUNT: Float =
-            (1.0 - ln(PRIVACY_MAX_BLOCKS / MIN_BLOCKS) / ln(MAX_BLOCKS / MIN_BLOCKS)).toFloat()
+            (1.0 - ln(PRIVACY_MAX_FACE_BLOCKS / MIN_FACE_BLOCKS) / ln(MAX_FACE_BLOCKS / MIN_FACE_BLOCKS)).toFloat()
+
+        /** How many blocks wide a face is: 3 * 10^(1 - amount). 70% gives ~6, 100% gives 3. */
+        fun faceBlocks(amount: Float, mode: Mode): Double {
+            val a = amount.coerceIn(0f, 1f).toDouble()
+            val b = MIN_FACE_BLOCKS * (MAX_FACE_BLOCKS / MIN_FACE_BLOCKS).pow(1.0 - a)
+            return if (mode == Mode.PRIVACY) min(b, PRIVACY_MAX_FACE_BLOCKS) else b
+        }
+
+        /**
+         * Block size in pixels. When the video has a detectable face, blocks are sized to the face
+         * ([faceWidthFraction] = face width / frame width), so close-ups get coarse blocks too.
+         * Otherwise falls back to a size based on the frame width.
+         */
+        fun blockPixels(displayW: Int, faceWidthFraction: Double?, amount: Float, mode: Mode): Double {
+            val frameBased = displayW / blocksAcross(amount, mode)
+            if (faceWidthFraction == null || faceWidthFraction <= 0.0) return frameBased
+            val faceBased = faceWidthFraction * displayW / faceBlocks(amount, mode)
+            val minPx = displayW / (if (mode == Mode.PRIVACY) PRIVACY_MAX_BLOCKS else MAX_BLOCKS)
+            return faceBased.coerceIn(minPx, displayW / 3.0)
+        }
 
         /** blocks = 14 * (64/14)^(1 - amount); 70% gives ~22 blocks across, like the reference. */
         fun blocksAcross(amount: Float, mode: Mode): Double {

@@ -31,6 +31,8 @@ class Analysis(
     val categories: ByteArray?,
     val faces: List<RectF>,
     val personPresent: Boolean,
+    /** Average colour (0xRRGGBB) of hair + face-skin pixels, or null if no head was found. */
+    val headColor: Int? = null,
 )
 
 /**
@@ -186,9 +188,20 @@ class MaskEngine(context: Context) : Closeable {
         } else emptyList()
 
         var personPixels = 0
-        categories?.let { c -> for (b in c) if (b.toInt() != 0) personPixels++ }
+        var hr = 0L; var hg = 0L; var hb = 0L; var hn = 0
+        categories?.let { c ->
+            for (i in c.indices) {
+                val k = c[i].toInt()
+                if (k != 0) personPixels++
+                if (k == 1 || k == 3) { // hair, face skin
+                    val px = inputPixels[i]
+                    hr += px shr 16 and 0xFF; hg += px shr 8 and 0xFF; hb += px and 0xFF; hn++
+                }
+            }
+        }
+        val headColor = if (hn > 0) (((hr / hn).toInt() shl 16) or ((hg / hn).toInt() shl 8) or (hb / hn).toInt()) else null
         val present = personPixels > SEG_SIZE * SEG_SIZE * PERSON_PRESENT_FRACTION || faces.isNotEmpty()
-        return Analysis(SEG_SIZE, SEG_SIZE, categories, faces, present)
+        return Analysis(SEG_SIZE, SEG_SIZE, categories, faces, present, headColor)
     }
 
     private fun detectFaces(image: com.google.mediapipe.framework.image.MPImage, w: Int, h: Int): List<RectF> {

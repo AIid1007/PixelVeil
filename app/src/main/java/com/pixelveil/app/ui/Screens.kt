@@ -317,7 +317,7 @@ fun EditorScreen(
             }
             Text(
                 if (settings.mode == Mode.PRIVACY) {
-                    "Coarser pixels, extra margin, and the whole frame covers if tracking is lost."
+                    "Face at most 6 blocks wide, face colours flattened, extra margin, and the whole frame covers if tracking is lost."
                 } else {
                     "Free pixel size for a stylised look. Not meant for hiding identity."
                 },
@@ -346,13 +346,19 @@ fun EditorScreen(
                 valueRange = minAmount..1f,
                 colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = Accent),
             )
-            if (settings.mode == Mode.PRIVACY) {
-                Text(
-                    "Privacy mode keeps pixels coarse enough to hide detail.",
-                    color = Muted,
-                    fontSize = 12.sp,
-                )
-            }
+            val faceW = remember(track) { track.faceWidthFraction }
+            Text(
+                when {
+                    faceW != null -> {
+                        val n = PixelSettings.faceBlocks(settings.amount, settings.mode).roundToInt()
+                        "Face ≈ $n blocks wide" + if (settings.mode == Mode.PRIVACY) " · face colours flattened" else ""
+                    }
+                    settings.mode == Mode.PRIVACY -> "No face found, so blocks are sized to the frame."
+                    else -> "Blocks are sized to the frame."
+                },
+                color = Muted,
+                fontSize = 12.sp,
+            )
             OutlinedButton(
                 onClick = { settings = settings.copy(amount = PixelSettings.DEFAULT_AMOUNT) },
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp),

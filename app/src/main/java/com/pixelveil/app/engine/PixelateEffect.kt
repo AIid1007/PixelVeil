@@ -53,6 +53,7 @@ internal class PixelateShaderProgram(
     private var gridTex = 0
     private var grid = ByteArray(1)
     private var neighbourGrid = ByteArray(1)
+    private var headGrid = ByteArray(1)
     private var gridBuffer: ByteBuffer = ByteBuffer.allocateDirect(1)
     private val tracker = MaskTracker()
 
@@ -85,16 +86,20 @@ internal class PixelateShaderProgram(
     override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
         val s = settings.value
         val displayW = if (analysisRotation % 180 == 90) texH else texW
-        val spec = GridSpec.create(texW, texH, displayW, PixelSettings.blocksAcross(s.amount, s.mode))
+        val blockPx = PixelSettings.blockPixels(displayW, track.faceWidthFraction, s.amount, s.mode)
+        val spec = GridSpec.create(texW, texH, displayW, displayW / blockPx)
 
         if (grid.size < spec.size) {
             grid = ByteArray(spec.size)
             neighbourGrid = ByteArray(spec.size)
+            headGrid = ByteArray(spec.size)
             gridBuffer = ByteBuffer.allocateDirect(spec.size).order(ByteOrder.nativeOrder())
         }
 
+        var headColor: Int? = null
+        var flatten = false
         if (s.target == Target.FULL_FRAME) {
-            java.util.Arrays.fill(grid, 0, spec.size, 0xFF.toByte())
+            java.util.Arrays.fill(grid, 0, spec.size, ON)
         } else {
             val (current, next) = track.around(presentationTimeUs)
             GridBuilder.build(current, s, analysisRotation, spec, grid)
@@ -106,6 +111,21 @@ internal class PixelateShaderProgram(
                 present = present || next.personPresent
             }
             tracker.apply(grid, spec, present, track.normalize(presentationTimeUs), s)
+
+            // Pixelated cells are stored as ON (128); in Privacy, cells on the head become HEAD (255)
+            // and the shader pulls them towards one average head colour so features don't show.
+            for (i in 0 until spec.size) if (grid[i].toInt() != 0) grid[i] = ON
+            headColor = current?.headColor ?: next?.headColor
+            if (s.mode == Mode.PRIVACY && headColor != null && s.target != Target.BACKGROUND) {
+                val headSettings = s.copy(target = Target.HEAD)
+                GridBuilder.build(current, headSettings, analysisRotation, spec, headGrid)
+                if (next != null && next !== current) {
+                    GridBuilder.build(next, headSettings, analysisRotation, spec, neighbourGrid)
+                    for (i in 0 until spec.size) if (neighbourGrid[i].toInt() != 0) headGrid[i] = HEAD
+                }
+                for (i in 0 until spec.size) if (headGrid[i].toInt() != 0 && grid[i] == ON) grid[i] = HEAD
+                flatten = true
+            }
         }
         uploadGrid(spec)
 
@@ -114,6 +134,12 @@ internal class PixelateShaderProgram(
         pixelProgram.setSamplerTexIdUniform("uGridSampler", gridTex, /* texUnitIndex= */ 1)
         pixelProgram.setFloatsUniform("uCellSize", floatArrayOf(spec.cellU.toFloat(), spec.cellV.toFloat()))
         pixelProgram.setFloatsUniform("uGridSize", floatArrayOf(spec.gw.toFloat(), spec.gh.toFloat()))
+        val hc = headColor ?: 0
+        pixelProgram.setFloatsUniform(
+            "uHeadColor",
+            floatArrayOf((hc shr 16 and 0xFF) / 255f, (hc shr 8 and 0xFF) / 255f, (hc and 0xFF) / 255f),
+        )
+        pixelProgram.setFloatUniform("uFlatten", if (flatten) HEAD_FLATTEN else 0f)
         pixelProgram.bindAttributesAndUniforms()
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GlUtil.checkGlError()
@@ -152,6 +178,12 @@ internal class PixelateShaderProgram(
     }
 
     companion object {
+        private const val ON: Byte = 0x80.toByte()
+        private const val HEAD: Byte = 0xFF.toByte()
+
+        /** How far head blocks are pulled towards the average head colour (0 = not at all, 1 = one flat colour). */
+        private const val HEAD_FLATTEN = 0.65f
+
         private const val VERTEX_SHADER = """
 attribute vec4 aFramePosition;
 varying vec2 vTexSamplingCoord;
@@ -168,11 +200,13 @@ uniform sampler2D uTexSampler;
 uniform sampler2D uGridSampler;
 uniform vec2 uCellSize;
 uniform vec2 uGridSize;
+uniform vec3 uHeadColor;
+uniform float uFlatten;
 varying vec2 vTexSamplingCoord;
 void main() {
   vec2 cell = floor(vTexSamplingCoord / uCellSize);
   float on = texture2D(uGridSampler, (cell + 0.5) / uGridSize).r;
-  if (on < 0.5) {
+  if (on < 0.25) {
     gl_FragColor = texture2D(uTexSampler, vTexSamplingCoord);
     return;
   }
@@ -184,7 +218,12 @@ void main() {
       sum += texture2D(uTexSampler, clamp(p, vec2(0.0), vec2(1.0)));
     }
   }
-  gl_FragColor = sum / 16.0;
+  vec4 avg = sum / 16.0;
+  // Head cells (255) in Privacy: pull towards one average head colour so features don't read.
+  if (on > 0.75) {
+    avg.rgb = mix(avg.rgb, uHeadColor, uFlatten);
+  }
+  gl_FragColor = avg;
 }
 """
     }
