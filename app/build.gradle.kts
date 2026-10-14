@@ -19,11 +19,25 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        // Fixed key so every build can be installed over the previous one.
+        // Fine for a personal tool; use a private key before publishing to the Play Store.
+        create("dev") {
+            storeFile = file("pixelveil-dev.keystore")
+            storePassword = "pixelveil"
+            keyAlias = "pixelveil"
+            keyPassword = "pixelveil"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("dev")
+        }
         release {
             isMinifyEnabled = false
             // Personal tool: release build signed with the debug key so it installs directly.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("dev")
             ndk {
                 // Release = real phones only (smaller APK). Debug keeps x86 so the PC emulator works.
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a")
