@@ -66,6 +66,7 @@ dependencies {
     implementation("androidx.media3:media3-muxer:$media3")
 
     implementation("com.google.mediapipe:tasks-vision:0.10.20")
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
 
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")

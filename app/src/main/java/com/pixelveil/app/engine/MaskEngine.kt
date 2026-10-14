@@ -11,7 +11,12 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
 import com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenter
+import org.tensorflow.lite.Interpreter
 import java.io.Closeable
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 
 /**
  * One analysed frame, in UPRIGHT image space (what the viewer sees).
@@ -34,13 +39,35 @@ class Analysis(
  */
 class MaskEngine(context: Context) : Closeable {
 
+    /** Primary segmenter: the model run directly with TensorFlow Lite on the CPU (works on every device). */
+    private var interpreter: Interpreter? = null
+    private var inputBuffer: ByteBuffer? = null
+    private var outputBuffer: ByteBuffer? = null
+    private var scaledInput: Bitmap? = null
+    private val inputPixels = IntArray(SEG_SIZE * SEG_SIZE)
+
+    /** Backup segmenter: MediaPipe's task (needs GPU features some devices lack). */
     private var segmenter: ImageSegmenter? = null
     private var faceDetector: FaceDetector? = null
 
     val usingFallback: Boolean
 
     init {
-        segmenter = try {
+        interpreter = try {
+            context.assets.openFd(SEGMENTER_MODEL).use { fd ->
+                FileInputStream(fd.fileDescriptor).channel.use { ch ->
+                    val model = ch.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+                    Interpreter(model, Interpreter.Options().setNumThreads(4))
+                }
+            }.also {
+                inputBuffer = ByteBuffer.allocateDirect(4 * SEG_SIZE * SEG_SIZE * 3).order(ByteOrder.nativeOrder())
+                outputBuffer = ByteBuffer.allocateDirect(4 * SEG_SIZE * SEG_SIZE * SEG_CLASSES).order(ByteOrder.nativeOrder())
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "TensorFlow Lite segmenter unavailable, trying MediaPipe", t)
+            null
+        }
+        segmenter = if (interpreter != null) null else try {
             ImageSegmenter.createFromOptions(
                 context,
                 ImageSegmenter.ImageSegmenterOptions.builder()
@@ -67,12 +94,13 @@ class MaskEngine(context: Context) : Closeable {
             Log.w(TAG, "MediaPipe face detector unavailable", t)
             null
         }
-        usingFallback = segmenter == null
+        usingFallback = interpreter == null && segmenter == null
     }
 
     fun analyze(upright: Bitmap, wantFaces: Boolean): Analysis {
         val w = upright.width
         val h = upright.height
+        if (interpreter != null) return analyzeWithTflite(upright, wantFaces)
         val seg = segmenter
         if (seg == null) {
             val faces = detectFacesFallback(upright)
@@ -109,6 +137,58 @@ class MaskEngine(context: Context) : Closeable {
         val total = (mw * mh).coerceAtLeast(1)
         val present = personPixels > total * PERSON_PRESENT_FRACTION || faces.isNotEmpty()
         return Analysis(mw, mh, categories, faces, present)
+    }
+
+    private fun analyzeWithTflite(upright: Bitmap, wantFaces: Boolean): Analysis {
+        val interp = interpreter!!
+        val input = inputBuffer!!
+        val output = outputBuffer!!
+        // The model takes the whole frame stretched to 256x256, RGB scaled to [-1, 1].
+        val scaled = scaledInput ?: Bitmap.createBitmap(SEG_SIZE, SEG_SIZE, Bitmap.Config.ARGB_8888).also { scaledInput = it }
+        android.graphics.Canvas(scaled).drawBitmap(
+            upright,
+            android.graphics.Rect(0, 0, upright.width, upright.height),
+            android.graphics.Rect(0, 0, SEG_SIZE, SEG_SIZE),
+            android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG),
+        )
+        scaled.getPixels(inputPixels, 0, SEG_SIZE, 0, 0, SEG_SIZE, SEG_SIZE)
+        input.rewind()
+        for (c in inputPixels) {
+            input.putFloat(((c shr 16 and 0xFF) - 127.5f) / 127.5f)
+            input.putFloat(((c shr 8 and 0xFF) - 127.5f) / 127.5f)
+            input.putFloat(((c and 0xFF) - 127.5f) / 127.5f)
+        }
+        input.rewind()
+        output.rewind()
+        var categories: ByteArray? = null
+        try {
+            interp.run(input, output)
+            output.rewind()
+            val f = output.asFloatBuffer()
+            val bytes = ByteArray(SEG_SIZE * SEG_SIZE)
+            for (i in bytes.indices) {
+                var best = 0
+                var bestV = f.get(i * SEG_CLASSES)
+                for (k in 1 until SEG_CLASSES) {
+                    val v = f.get(i * SEG_CLASSES + k)
+                    if (v > bestV) { bestV = v; best = k }
+                }
+                bytes[i] = best.toByte()
+            }
+            categories = bytes
+        } catch (t: Throwable) {
+            Log.w(TAG, "Segmentation failed on a frame", t)
+        }
+
+        val faces = if (wantFaces) {
+            val mp = BitmapImageBuilder(upright).build()
+            try { detectFaces(mp, upright.width, upright.height) } finally { mp.close() }
+        } else emptyList()
+
+        var personPixels = 0
+        categories?.let { c -> for (b in c) if (b.toInt() != 0) personPixels++ }
+        val present = personPixels > SEG_SIZE * SEG_SIZE * PERSON_PRESENT_FRACTION || faces.isNotEmpty()
+        return Analysis(SEG_SIZE, SEG_SIZE, categories, faces, present)
     }
 
     private fun detectFaces(image: com.google.mediapipe.framework.image.MPImage, w: Int, h: Int): List<RectF> {
@@ -155,6 +235,10 @@ class MaskEngine(context: Context) : Closeable {
     }
 
     override fun close() {
+        try { interpreter?.close() } catch (_: Throwable) {}
+        interpreter = null
+        scaledInput?.recycle()
+        scaledInput = null
         try { segmenter?.close() } catch (_: Throwable) {}
         try { faceDetector?.close() } catch (_: Throwable) {}
         segmenter = null
@@ -167,5 +251,7 @@ class MaskEngine(context: Context) : Closeable {
         const val FACE_MODEL = "blaze_face_short_range.tflite"
         private const val PERSON_PRESENT_FRACTION = 0.002
         private const val MAX_FALLBACK_FACES = 6
+        private const val SEG_SIZE = 256
+        private const val SEG_CLASSES = 6
     }
 }
