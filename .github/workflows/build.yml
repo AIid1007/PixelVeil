@@ -21,14 +21,8 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Download on-device models (bundled into the APK)
-        run: |
-          mkdir -p app/src/main/assets
-          curl -fsSL -o app/src/main/assets/selfie_multiclass_256x256.tflite \
-            https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite
-          curl -fsSL -o app/src/main/assets/blaze_face_short_range.tflite \
-            https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite
-          ls -la app/src/main/assets
+      - name: Download on-device models (same Gradle step people run locally)
+        run: ./gradlew --no-daemon :app:downloadModels && ls -la app/src/main/assets
 
       - name: Publish the model files (Apache 2.0, from Google MediaPipe)
         uses: softprops/action-gh-release@v2
@@ -102,14 +96,6 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-
-      - name: Download on-device models
-        run: |
-          mkdir -p app/src/main/assets
-          curl -fsSL -o app/src/main/assets/selfie_multiclass_256x256.tflite \
-            https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite
-          curl -fsSL -o app/src/main/assets/blaze_face_short_range.tflite \
-            https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite
 
       - name: Build test APKs
         run: ./gradlew --no-daemon assembleDebug assembleDebugAndroidTest

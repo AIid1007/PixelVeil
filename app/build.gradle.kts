@@ -98,23 +98,56 @@ dependencies {
 }
 
 // Downloads the on-device models into src/main/assets on the first build (they are not in git).
+// Tries Google's server first, then the copy on this repo's GitHub Releases page; retries each.
+// Downloads go to a .part file first, so an interrupted download never leaves a broken model.
 val modelFiles = mapOf(
-    "selfie_multiclass_256x256.tflite" to
+    "selfie_multiclass_256x256.tflite" to listOf(
         "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
-    "blaze_face_short_range.tflite" to
+        "https://github.com/AIid1007/pixelveil/releases/download/models/selfie_multiclass_256x256.tflite",
+    ),
+    "blaze_face_short_range.tflite" to listOf(
         "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite",
+        "https://github.com/AIid1007/pixelveil/releases/download/models/blaze_face_short_range.tflite",
+    ),
 )
 val downloadModels by tasks.registering {
     val assetsDir = file("src/main/assets")
     doLast {
         assetsDir.mkdirs()
-        modelFiles.forEach { (name, url) ->
+        modelFiles.forEach { (name, urls) ->
             val target = File(assetsDir, name)
-            if (!target.exists() || target.length() == 0L) {
-                logger.lifecycle("Downloading model $name")
-                URI(url).toURL().openStream().use { input ->
-                    target.outputStream().use { output -> input.copyTo(output) }
+            if (target.exists() && target.length() > 100_000L) return@forEach
+            val part = File(assetsDir, "$name.part")
+            var done = false
+            var lastError: Exception? = null
+            for (url in urls) {
+                for (attempt in 1..3) {
+                    try {
+                        logger.lifecycle("Downloading model $name (attempt $attempt): $url")
+                        val conn = URI(url).toURL().openConnection().apply {
+                            connectTimeout = 20_000
+                            readTimeout = 60_000
+                        }
+                        conn.getInputStream().use { input -> part.outputStream().use { output -> input.copyTo(output) } }
+                        if (part.length() < 100_000L) throw IllegalStateException("file too small (${part.length()} bytes)")
+                        target.delete()
+                        if (!part.renameTo(target)) throw IllegalStateException("could not save $name")
+                        done = true
+                        break
+                    } catch (e: Exception) {
+                        lastError = e
+                        part.delete()
+                        logger.warn("Download failed: ${e.message}")
+                        Thread.sleep(2_000L * attempt)
+                    }
                 }
+                if (done) break
+            }
+            if (!done) {
+                throw GradleException(
+                    "Could not download $name. Check your internet connection and build again, " +
+                        "or copy the file into app/src/main/assets/ yourself. Last error: ${lastError?.message}",
+                )
             }
         }
     }
