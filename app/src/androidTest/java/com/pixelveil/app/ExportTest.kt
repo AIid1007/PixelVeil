@@ -164,9 +164,12 @@ class ExportTest {
     /** Writes a small PNG of [b] to logcat in base64 chunks so CI can show the result. */
     private fun logImage(name: String, b: Bitmap) {
         val small = Bitmap.createScaledBitmap(b, 270, 480, true)
-        val bytes = java.io.ByteArrayOutputStream().also { small.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+        val bytes = java.io.ByteArrayOutputStream().also { small.compress(Bitmap.CompressFormat.JPEG, 85, it) }.toByteArray()
         val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-        b64.chunked(3000).forEachIndexed { i, chunk -> Log.i("PVIMG", "$name|$i|$chunk") }
+        b64.chunked(2000).forEachIndexed { i, chunk ->
+            Log.i("PVIMG", "$name|$i|$chunk")
+            Thread.sleep(30) // stay under logcat's rate limit
+        }
         Log.i("PVIMG", "$name|end|")
     }
 
